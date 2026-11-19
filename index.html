@@ -3343,6 +3343,9 @@ async function readImportFile(file) {
 }
 function importPreview(evs) {
   const im = S.imp; if (!im) return "";
+  if (im.done) return `<div class="ocr impdone"><div class="stack" style="flex:1"><b>Imported ${im.done.n} scouted robots${im.done.skipped ? ` (skipped ${im.done.skipped} already here)` : ""}.</b>
+    <p class="small muted" style="margin:0">Events: ${esc(im.done.events.join(", "))}. Survey: ${esc(im.done.survey)}. They're now in the data pool.</p>
+    <div class="bar"><button class="btn sm primary" data-act="nav" data-v="raw">Open Raw Data</button><button class="btn sm" data-act="nav" data-v="analyze">Open Analyze</button><button class="btn sm" data-act="impCancel">Close</button></div></div></div>`;
   if (im.error) return `<div class="ocr"><div class="stack" style="flex:1"><b>Couldn't import that file.</b><p class="small muted">${esc(im.error)}</p><div><button class="btn sm" data-act="impCancel">Close</button></div></div></div>`;
   const d = im.data, saved = evs.filter(e => e.saved);
   return `<div class="ocr"><div class="stack" style="flex:1;min-width:0">
@@ -3358,16 +3361,37 @@ function importPreview(evs) {
 async function runImport() {
   const im = S.imp, d = im.data, uid = S.user.uid, me = S.me?.name || "";
   try {
-    // 1) surveys: reuse one that's already here (same id, or same name and questions), otherwise add it as a closed survey
-    const svMap = {}, newSurveys = [];
+    im.step = "surveys";
+    // 1) surveys: use the matching survey that's already here. Questions are matched by section + wording + type,
+    //    so a file made on another site (different question ids) still lands in your survey. Otherwise add it as a closed survey.
+    const svMap = {}, fMap = {}, newSurveys = [];
+    const qk = f => [f.section || "", String(f.label || "").trim().toLowerCase(), f.type].join("|");
     for (const sv of d.surveys || []) {
-      const sig = x => x.fields.map(f => f.id).join(",");
-      const here = surveyById(sv.id) || S.surveys.find(x => x.name === sv.name && sig(x) === sig(sv));
-      if (here) svMap[sv.id] = here.id;
-      else { const id = await S.api.saveSurvey({name: `${sv.name} (imported)`, active: false, fields: sv.fields}); svMap[sv.id] = id; newSurveys.push(sv.id); }
+      let here = surveyById(sv.id), map = null;
+      if (!here) {
+        let best = null;
+        for (const x of S.surveys) {
+          const byKey = Object.fromEntries(x.fields.map(f => [qk(f), f.id]));
+          const m = {}; let hit = 0; for (const f of sv.fields) if (byKey[qk(f)]) { m[f.id] = byKey[qk(f)]; hit++; }
+          const sc = hit / Math.max(1, sv.fields.length) + (x.active ? .01 : 0);
+          if (hit / Math.max(1, sv.fields.length) >= .6 && (!best || sc > best.sc)) best = {x, m, sc};
+        }
+        if (best) { here = best.x; map = best.m; }
+      } else map = Object.fromEntries(sv.fields.map(f => [f.id, f.id]));
+      if (here) { svMap[sv.id] = here.id; fMap[sv.id] = map; }
+      else { const id = await S.api.saveSurvey({name: `${sv.name} (imported)`, active: false, fields: sv.fields}); svMap[sv.id] = id; fMap[sv.id] = null; newSurveys.push(sv.id); }
     }
-    for (const v of d.variables || []) if (newSurveys.includes(v.surveyId) && svMap[v.surveyId]) await S.api.saveVariable({surveyId: svMap[v.surveyId], name: v.name, expr: v.expr, combine: v.combine || "avg", decimals: v.decimals ?? 2});
+    im.step = "variables";
+    for (const v of d.variables || []) {
+      const to = svMap[v.surveyId]; if (!to) continue;
+      const map = fMap[v.surveyId];
+      if (S.vars.some(x => x.surveyId === to && x.name === v.name)) continue;
+      let ok = true;
+      const expr = map ? String(v.expr).replace(/\{(\w+:)?([^}]+)\}/g, (all, sc, id) => { if (id === "score") return all; if (!map[id]) { ok = false; return all; } return `{${sc || ""}${map[id]}}`; }) : v.expr;
+      if (ok) await S.api.saveVariable({surveyId: to, name: v.name, expr, combine: v.combine || "avg", decimals: v.decimals ?? 2});
+    }
     // 2) events
+    im.step = "events";
     const evMap = {};
     for (const p of im.plan) {
       if (p.target !== "new") {
@@ -3380,12 +3404,14 @@ async function runImport() {
       }
     }
     // 3) team names and photos fill in only what's missing here
+    im.step = "teams";
     for (const [t, x] of Object.entries(d.teams || {})) {
       const cur = S.teams[t] || {}, upd = {};
       for (const k of ["name", "from", "notes", "photo"]) if (x[k] && !cur[k]) upd[k] = x[k];
       if (Object.keys(upd).length) await S.api.saveTeam(t, upd);
     }
     // 4) matches, skipping ones already here
+    im.step = "matches";
     const sig = r => [r.team, String(r.match), r.scoutName || "", r.t].join("|");
     const have = {}; for (const r of S.allResponses) (have[r.evId] ||= new Set()).add(sig(r));
     const rows = [], names = Object.fromEntries(eventList().map(e => [e.id, e.name]));
@@ -3394,17 +3420,27 @@ async function runImport() {
       const ev = evMap[r.eventId], svId = svMap[r.surveyId]; if (!ev || !svId) { skipped++; continue; }
       if (have[ev]?.has(sig(r))) { skipped++; continue; }
       (have[ev] ||= new Set()).add(sig(r));
-      const sv = surveyById(svId) || d.surveys.find(x => x.id === r.surveyId);
+      const sv = surveyById(svId) || d.surveys.find(x => x.id === r.surveyId), map = fMap[r.surveyId];
+      const answers = map ? Object.fromEntries(Object.entries(r.answers || {}).filter(([k]) => map[k]).map(([k, v]) => [map[k], v])) : (r.answers || {});
       const row = {surveyId: svId, surveyName: sv?.name || r.surveyName || "", season: r.season || d.season || "", event: names[ev] || im.plan.find(p => evMap[p.src.id] === ev)?.src.name || "", eventId: ev,
-        alliance: r.alliance || "", uid, scoutName: r.scoutName || "Imported", team: String(r.team), match: String(r.match), answers: r.answers || {}, t: r.t || Date.now(), imported: true, importedBy: me, ...(r.training ? {training: true} : {})};
+        alliance: r.alliance || "", uid, scoutName: r.scoutName || "Imported", team: String(r.team), match: String(r.match), answers, t: r.t || Date.now(), imported: true, importedBy: me, ...(r.training ? {training: true} : {})};
       row.score = scoreOf(row, sv?.fields ? sv : null); rows.push(row);
     }
     if (rows.length) await S.api.importResponses(rows);
-    if (Array.isArray(S.pool.ids)) { S.pool.ids = [...new Set([...S.pool.ids, ...Object.values(evMap)])]; savePool(); }
-    S.imp = null;
-    toast(`Imported ${rows.length} scouted robots${skipped ? `, skipped ${skipped} already here` : ""}`);
+    // put the imported events in the data pool so Raw Data, Analyze and Team Lookup show them right away
+    S.pool.ids = [...new Set([...poolIds(), ...Object.values(evMap)])]; savePool(); applyPool(); updatePoolChip();
+    const svName = [...new Set(Object.values(svMap))].map(id => surveyById(id)?.name).filter(Boolean).join(", ") || "the imported survey";
+    for (const k of ["raw", "ana", "look"]) if (S[k]) S[k].survey = Object.values(svMap)[0] || S[k].survey;
+    S.imp = {done: {n: rows.length, skipped, events: im.plan.map(p => p.target === "new" ? p.src.name : eventList().find(e => e.id === p.target)?.name || p.src.name), survey: svName}};
     keepScroll(renderView);
-  } catch (er) { toast(errMsg(er), true); }
+  } catch (er) {
+    console.error("Import failed at", im.step, er);
+    const c = er?.code || er?.message || "";
+    S.imp = {error: /permission-denied/.test(c)
+      ? `The database refused the import (while saving ${im.step}). Usually that means the security rules aren't published yet: Firebase → Firestore Database → Rules, paste firestore.rules, Publish. Then try again. Already-imported matches are skipped.`
+      : `Stopped while saving ${im.step}: ${errMsg(er)}. Nothing is lost; try again and matches already imported are skipped.`};
+    keepScroll(renderView);
+  }
 }
 function demoSaveCard() {
   const old = S.api.earlierSaves?.() || [];
